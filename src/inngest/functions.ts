@@ -1,18 +1,17 @@
 import {z} from 'zod'
 import Sandbox from '@e2b/code-interpreter'
-import { createAgent, createTool } from '@inngest/agent-kit'
+import { createAgent, createNetwork, createTool } from '@inngest/agent-kit'
 
 import { PROMPT } from '@/prompt'
 
 import { inngest } from './client'
-import { getSandbox } from './utils'
+import { getSandbox, lastAssistantTextMessageContent } from './utils'
 import { grok } from 'inngest'
-import { stderr, stdout } from 'process'
 
 export const helloWorld = inngest.createFunction(
     { id: "helloWorld" },
     { event: "test/hello.world" },
-    async ({event, step} => {
+    async ({event, step}) => {
         const sandboxId = await step.run("get-sandbox-id", async () => {
             const sandbox = await Sandbox.create("lovable-clone-jay5")
             return sandbox.sandboxId
@@ -21,7 +20,7 @@ export const helloWorld = inngest.createFunction(
 
         const codeAgent = createAgent({
             name: "code-agent",
-            description: "An expert coding agent"
+            description: "An expert coding agent",
             system: PROMPT,
             model: grok({
                 model: "grok-3-latest"
@@ -51,12 +50,113 @@ export const helloWorld = inngest.createFunction(
                             } catch (e) {
                                 console.log(
                                     `Command failed: ${e} \nstdout: ${buffers.stdout} \nstderror: ${buffers.stderr}`
-                                ),
+                                )
+                                return `Command failed: ${e} \nstdout: ${buffers.stdout} \nstderror: ${buffers.stderr}`
                             }
                         })
                     } 
+                }),
+                createTool({
+                    name: "createOrUpdateFiles",
+                    description: "Create or update the files in the sandbox",
+                    parameters: z.object({
+                        files: z.array(
+                            z.object({
+                                path: z.string(),
+                                content: z.string(),
+                            }),
+                        ),
+                    }),
+                    handler: async (
+                        {files},
+                        {step, network}
+                    ) => {
+                        const newFiles = await step?.run("createOrUpdateFiles", async () => {
+                            try {
+                                const updatedFiles = network.state.data.files || {}
+                                const sandbox = await getSandbox(sandboxId)
+                                for(const file of files){
+                                    await sandbox.files.write(file.path, file.content)
+                                    updatedFiles[file.path] = file.content
+                                }
+
+                                return updatedFiles
+                            } catch (error) {
+                                return "Error: " + error
+                            }
+                        })
+
+                        if(typeof newFiles === "object"){
+                            network.state.data.files = newFiles
+                        }
+                    }
+                }),
+                createTool({
+                    name: "readFiles",
+                    description: "Read files from the sandbox",
+                    parameters: z.object({
+                        files: z.array(z.string()),
+                    }),
+                    handler: async ({files}, {step}) => {
+                        return await step?.run("readFiles", async () => {
+                            try {
+                                const sandbox = await getSandbox(sandboxId)
+                                const contents = []
+                                for(const file of files){
+                                    const content = await sandbox.files.read(file)
+                                    contents.push({path: file, content})
+                                }
+
+                                return JSON.stringify(contents)
+                            } catch (error) {
+                                return "Error: " + error
+                            }
+                        })
+                    }
                 })
-            ]
+            ],
+            lifecycle: {
+                onResponse: async ({ result, network}) => {
+                    const lastAssistantMessageText = lastAssistantTextMessageContent(result)
+
+                    if(lastAssistantMessageText && network){
+                        if(lastAssistantMessageText.includes("<task_summary>")){
+                            network.state.data.summary = lastAssistantMessageText
+                        }
+                    }
+
+                    return result
+                },
+            },
+        });
+
+        const network = createNetwork({
+            name: "coding-agent-network",
+            agents: [codeAgent],
+            maxIter: 15,
+            router: async ({network}) => {
+                const summary = network.state.data.summary
+
+                if(summary){
+                    return
+                }
+
+                return codeAgent
+            }
         })
+
+        const result = await network.run(event.data.value)
+
+        const sandboxUrl = await step.run("get-sandbox-utl", async () => {
+            const sandbox = await getSandbox(sandboxId)
+            const host = sandbox.getHost(3000)
+            return `https://${host}`
+        })
+
+        return {
+            url: sandboxUrl,
+            title: "Fragment",
+            files: network.state.data.files,
+            summary: network.state.data.summary
+        }
     })
-)
